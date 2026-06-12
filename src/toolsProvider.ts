@@ -64,11 +64,12 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 			.map(({ label, link }) => [label, link] as [string, string]);
 
 	const extractImages = (body:string, url:string, maxImages:number, searchTerms?:string[]) =>
-		[...body.matchAll(/<img(\s+[^>]*)/g)]
+		[...body.matchAll(/<img\b([^>]*?)\/?>/gi)]
 			.filter(x => x[1])
 			.map(([, attributes], index) => {
-				const alt = attributes.match(/\salt="([^"]+)"/)?.[1] || "";
-				const src = attributes.match(/\ssrc="([^"]+)"/)?.[1];
+				const alt = attributes.match(/(?:^|\s)alt=["']([^"']+)["']/i)?.[1] || "";
+				const src = attributes.match(/(?:^|\s)src=["']([^"']+)["']/i)?.[1]
+					|| attributes.match(/(?:^|\s)data-src=["']([^"']+)["']/i)?.[1]; // Fall back to data-src for lazy-loaded images
 				return {
 					index,
 					alt,
@@ -80,7 +81,12 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 						|| alt.length,
 				};
 			})
-			.filter(({ src }) => src && src.startsWith('http') && src.match(/\.(svg|png|webp|gif|jpe?g)(\?.*)?$/i)) // Filter valid image URLs
+			.filter(({ src }) => {
+				// Image URLs must be http(s) but may lack a file extension (e.g. Cloudinary, Unsplash, imgix CDN URLs)
+				if (!src || !src.startsWith('http')) return false;
+				const extension = /\.([a-z0-9]+)$/i.exec(src.split('?')[0])?.[1]?.toLowerCase();
+				return !extension || !nonImageExtensions.includes(extension);
+			})
 			.sort((a, b) => b.score - a.score) // Sort by score in descending order
 			.slice(0, maxImages) // Limit number of images
 			.sort((a, b) => a.index - b.index) // Sort by original order in the body
@@ -135,8 +141,9 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 							return null; // Skip empty images
 						}
 						// save the image to a file in the working directory
-						const fileExtension = /image\/([\w]+)/.exec(imageResponse.headers.get('content-type') || '')?.[1]
-							|| /\.([\w]+)(?:\?.*)$/.exec(url)?.[1] // Extract extension from URL if content type is not available
+						const mimeType = (imageResponse.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+						const fileExtension = mimeToExtension[mimeType]
+							|| /\.([a-z0-9]+)$/i.exec(url.split('?')[0])?.[1]?.toLowerCase() // Extract extension from URL if content type is not available
 							|| 'jpg'; // Default to jpg if no content type
 						const fileName = `${timestamp}-${index}.${fileExtension}`;
 						const filePath = join(workingDirectory, fileName);
@@ -210,8 +217,10 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 				const links = maxLinks && extractLinks(body, url, maxLinks, searchTerms);
 				const imagesToFetch = maxImages ? extractImages(body, url, maxImages, searchTerms) : [];
 				const images = maxImages &&
-					(await viewImagesTool.implementation({ imageURLs: imagesToFetch.map(x => x[1]) }, context) as string[])
-					.map((markdown, index) => [imagesToFetch[index][0], markdown] as [string, string]);
+					(imagesToFetch.length > 0
+						? (await viewImagesTool.implementation({ imageURLs: imagesToFetch.map(x => x[1]) }, context) as string[])
+							.map((markdown, index) => [imagesToFetch[index][0], markdown] as [string, string])
+						: []);
 
 				// fetch the text content from the body using DOMParser
 				const allContent = contentLimit && body
@@ -266,6 +275,21 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 
 const undefinedIfAuto = (value: unknown, autoValue: unknown) =>
 	value === autoValue ? undefined : value as undefined;
+
+// Extensions that disqualify a URL from being treated as an image (extensionless URLs are allowed)
+const nonImageExtensions = ["js", "css", "html", "htm", "json", "xml", "pdf", "zip", "gz", "tar", "mp4", "mp3", "webm", "ogg", "woff", "woff2", "ttf", "eot"];
+
+const mimeToExtension: Record<string, string> = {
+	"image/jpeg": "jpg",
+	"image/jpg": "jpg",
+	"image/png": "png",
+	"image/gif": "gif",
+	"image/webp": "webp",
+	"image/svg+xml": "svg",
+	"image/avif": "avif",
+	"image/bmp": "bmp",
+	"image/tiff": "tiff",
+};
 
 const spoofedUserAgents = [
 	// Random spoofed realistic user agents for DuckDuckGo
