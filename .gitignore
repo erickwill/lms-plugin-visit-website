@@ -1,2 +1,4 @@
 .lmstudio
 node_modules
+dist
+.claude/

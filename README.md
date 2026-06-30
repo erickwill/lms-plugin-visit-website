@@ -21,3 +21,9 @@ The plugin is available for download on the
 With the plugin enabled, the assistant can be instructed to visit a web page by providing a URL.
 
 This plugin works well in combination with the [DuckDuckGo Search Tool](https://github.com/danielsig/lms-plugin-duckduckgo) which can be used to find relevant URLs.
+
+## Credits
+
+[kylebambrick](https://github.com/kylebambrick) for surfacing the lazy-load and CDN image URL issues.
+
+[vadimfedenko](https://lmstudio.ai/vadimfedenko) for the Analyze Images tool approach.
