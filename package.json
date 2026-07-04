@@ -1,19 +1,26 @@
 {
-  "name": "lms-plugin-visit-website",
-  "version": "1.1.0",
-  "description": "LM Studio plugin for visiting websites",
-  "main": "index.js",
-  "scripts": {
-    "dev": "lms dev",
-    "push": "lms push"
-  },
-  "author": "Daniel Sig",
-  "license": "MIT",
-  "dependencies": {
-    "@lmstudio/sdk": "^1.3.0",
-    "zod": "3.24.1"
-  },
-  "devDependencies": {
-    "@types/node": "^20.14.8"
-  }
+	"name": "lms-plugin-visit-website",
+	"version": "1.2.0",
+	"description": "LM Studio plugin for visiting websites",
+	"main": "index.js",
+	"scripts": {
+		"dev": "lms dev",
+		"push": "lms push"
+	},
+	"author": "Daniel Sig",
+	"license": "MIT",
+	"dependencies": {
+		"@lmstudio/sdk": "^1.3.0",
+		"zod": "3.24.1"
+	},
+	"devDependencies": {
+		"@eslint/js": "^9.39.4",
+		"@stylistic/eslint-plugin": "^5.10.0",
+		"@types/node": "^20.19.43",
+		"eslint": "^9.39.4",
+		"globals": "^17.7.0",
+		"jiti": "^2.7.0",
+		"typescript": "^6.0.3",
+		"typescript-eslint": "^8.62.1"
+	}
 }

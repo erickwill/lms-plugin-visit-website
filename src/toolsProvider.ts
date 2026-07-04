@@ -1,8 +1,18 @@
 import { tool, Tool, ToolsProviderController } from "@lmstudio/sdk";
-import { writeFile } from "fs/promises";
-import { join } from "path";
 import { z } from "zod";
 import { configSchematics } from "./config";
+import {
+	analyzeImages,
+	buildAnalysisPrompt,
+	computeMaxTokens,
+	downloadImages,
+	IMAGE_ANALYSIS_SYSTEM_DEFAULT,
+	limitAltText,
+	parseImageRef,
+	resolveTargetWords,
+	resolveVisionModel,
+	toMarkdownLink,
+} from "./imageVision";
 
 export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]> {
 	const tools:Tool[] = [];
@@ -17,17 +27,6 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 		.replace(/\n{3,}/g, '\n\n')
 		.replace(/ *\n */g, '\n')
 		.trim();
-
-	// Build a markdown link with text/URL escaped so brackets, parens, and newlines can't break it. Prefix "!" for an image.
-	const toMarkdownLink = (text:string, url:string):string => {
-		const safeText = text
-			.replace(/\\/g, '\\\\') // escape backslashes first
-			.replace(/[\[\]]/g, '\\$&') // escape brackets
-			.replace(/\s+/g, ' ')
-			.trim();
-		const safeUrl = url.trim().replace(/[()\s]/g, encodeURIComponent); // encode parens/spaces that would close the url
-		return `[${safeText}](${safeUrl})`;
-	};
 
 	const fetchHTML = async (url:string, signal:AbortSignal, warn:(msg:string) => void) => {
 		// Perform the fetch request with abort signal
@@ -49,7 +48,7 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 		const bodyEnd = html.lastIndexOf("</body>") || html.length - 1;
 		const body = html.substring(bodyStart, bodyEnd);
 		return { html, head, body };
-	}
+	};
 
 	const extractLinks = (body:string, url:string, maxLinks:number, searchTerms?:string[]) =>
 		[...body.matchAll(/<a\s+[^>]*?href="([^"]+)"[^>]*>((?:\n|.)*?)<\/a>/g)]
@@ -89,7 +88,7 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 		[...body.matchAll(/<img\b([^>]*?)\/?>/gi)]
 			.filter(x => x[1])
 			.map(([, attributes], index) => {
-				const alt = attributes.match(/(?:^|\s)alt=["']([^"']+)["']/i)?.[1] || "";
+				const alt = limitAltText(attributes.match(/(?:^|\s)alt=["']([^"']+)["']/i)?.[1] || "");
 				const src = attributes.match(/(?:^|\s)src=["']([^"']+)["']/i)?.[1]
 					|| attributes.match(/(?:^|\s)data-src=["']([^"']+)["']/i)?.[1]; // Fall back to data-src for lazy-loaded images
 				return {
@@ -113,157 +112,51 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 			.slice(0, maxImages) // Limit number of images
 			.sort((a, b) => a.index - b.index); // Sort by original order in the body
 
-	// Download images to the working directory and return them as escaped markdown image references (alt preserved).
-	const downloadImages = async (
-		images:{ alt:string, src:string }[],
-		status:(msg:string) => void,
-		warn:(msg:string) => void,
-		signal:AbortSignal,
-	):Promise<string[]> => {
-		status("Downloading images...");
-		const workingDirectory = ctl.getWorkingDirectory();
-		const timestamp = Date.now();
-		const downloadPromises = images.map(async ({ alt, src }, i) => {
-			if(!/^https?:\/\//i.test(src))
-				return "!" + toMarkdownLink(alt, src); // Local path or already-downloaded file — pass through
-
-			const index = i + 1;
-			try {
-				const headers = spoofHeaders(src);
-				const imageResponse = await fetch(src, {
-					method: "GET",
-					signal,
-					headers,
-				});
-				if (!imageResponse.ok) {
-					warn(`Failed to fetch image ${index}: ${imageResponse.statusText}`);
-					return null; // Skip this image if download fails
-				}
-				const bytes = await imageResponse.bytes();
-				if (bytes.length === 0) {
-					warn(`Image ${index} is empty: ${src}`);
-					return null; // Skip empty images
-				}
-				// save the image to a file in the working directory
-				const mimeType = (imageResponse.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-				const fileExtension = mimeToExtension[mimeType]
-					|| /\.([a-z0-9]+)$/i.exec(src.split('?')[0])?.[1]?.toLowerCase() // Extract extension from URL if content type is not available
-					|| 'jpg'; // Default to jpg if no content type
-				const fileName = `${timestamp}-${index}.${fileExtension}`;
-				const filePath = join(workingDirectory, fileName);
-				const localPath = filePath.replace(/\\/g, '/').replace(/^C:/, '') // Normalize path for web compatibility
-				await writeFile(filePath, bytes, 'binary');
-				return "!" + toMarkdownLink(alt, localPath);
-			} catch (error:unknown) {
-				if (error instanceof DOMException && error.name === "AbortError")
-					return null; // Skip if download was aborted
-				warn(`Error fetching image ${index}: ${error instanceof Error ? error.message : String(error)}`);
-				return null; // Skip this image on error
-			}
-		});
-		return (await Promise.all(downloadPromises)).filter((x):x is string => x !== null);
-	};
-
-	// Vision analysis over working-directory images using the current model; prompt and target word count are supplied by the caller.
-	const analyzeImages = async (
-		paths:string[],
-		prompt:string,
-		targetWords:number,
-		status:(msg:string) => void,
-		warn:(msg:string) => void,
-	) => {
-		try {
-			const model = await ctl.client.llm.model();
-			if (!model.vision)
-				return "Error: The current model does not support vision. Load a vision-capable model to analyze images.";
-			const workingDirectory = ctl.getWorkingDirectory();
-			let content = prompt.trim();
-			if (!content.endsWith('.'))
-				content += '.';
-			if(!/\d+\s*(word|token|sentence)s?/i.test(content) && targetWords > 0)
-				content += ` Keep the response to roughly ${targetWords} words.`;
-			const maxTokens = Math.round(targetWords / 0.75 * 2); // words to tokens (~1.33/word), doubled so the cap won't truncate the target
-			// Some reasoning models leak their hidden thinking into the output; keep only the final answer.
-			const stripReasoning = (text:string):string | null => {
-				text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-				const openIdx = text.indexOf('<|channel>');
-				if (openIdx === -1) return text || null;
-				const closeIdx = text.indexOf('<channel|>');
-				const after = closeIdx !== -1 ? text.slice(closeIdx + '<channel|>'.length).trim() : '';
-				if (after) return after;
-				// Nothing after the closing tag (or none present) — fall back to the content inside the block
-				const insideStart = openIdx + '<|channel>'.length;
-				const insideEnd = closeIdx !== -1 ? closeIdx : text.length;
-				return text.slice(insideStart, insideEnd).replace(/^\w+\n/, '').trim() || null;
-			};
-			status(`Analyzing ${paths.length} image${paths.length > 1 ? "s" : ""}...`);
-			// One request per image; LM Studio queues past its parallel slots, and Promise.all preserves order.
-			return await Promise.all(paths.map(async (imagePath, i):Promise<{ path:string; analysis:string | null }> => {
-				const filename = imagePath.replace(/^!\[[^\]]*\]\(/, '').replace(/\)$/, '').split('/').pop()!;
-				const absolutePath = join(workingDirectory, filename);
-				try {
-					const fileHandle = await ctl.client.files.prepareImage(absolutePath);
-					const result = await model.respond([{
-						role: "user",
-						content,
-						images: [fileHandle],
-					}], { maxTokens });
-					return { path: imagePath, analysis: stripReasoning(result.content) };
-				} catch (error:unknown) {
-					if (error instanceof Error)
-						warn(`Failed to analyze image ${i + 1}: ${error.message}`);
-					return { path: imagePath, analysis: null };
-				}
-			}));
-		} catch (error:unknown) {
-			if (error instanceof DOMException && error.name === "AbortError")
-				return "Analysis aborted by user.";
-			if (error instanceof Error)
-				return `Error: ${error.message}`;
-			return "Unknown error occurred during analysis.";
-		}
-	};
-
 	const viewImagesTool = tool({
 		name: "View Images",
-		description: "View images from online URLs and/or local paths. Returns one { image, analysis } per image; write each returned `image` markdown into your reply, not inside a code block, to display it. Optionally describe each image with the current vision model (see wordsPerImage and focus).",
+		description: "Download and optionally analyze images from online URLs and/or local paths and receive a list of objects with: \n- `image` markdown that can be written directly into your reply (not in a code block) for displaying the downloaded image\n- `analysis` of the image if `wordsPerImage` and/or `focus` are set, powered by local vision model, null if no analysis was performed.",
 		parameters: {
-			imageURLs: z.array(z.string()).min(1).describe("Online image URLs and/or local image paths (or ![alt](path) markdown) to view."),
+			images: z.array(z.string()).min(1).describe("Online image URLs and/or local image paths (or ![alt](path) markdown) to view."),
 			wordsPerImage: z.number().int().min(0).max(1000).optional().describe("How long each image's description should be, in words. Set this whenever you analyze so descriptions stay concise; about 100 divided by the number of images is a good target (e.g. ~10 words each for 10 images). Analysis runs when this or focus is set."),
 			focus: z.string().optional().describe("What to focus on when analyzing. Providing it enables analysis even when wordsPerImage is omitted. Defaults to a detailed general description."),
 		},
-		implementation: async ({ imageURLs, wordsPerImage, focus }, { status, warn, signal }) => {
+		implementation: async ({ images, wordsPerImage, focus }, { status, warn, signal }) => {
 			try {
-				const items = imageURLs.map((ref, i) => ({
-					alt: ref.match(/^!\[([^\]]*)\]/)?.[1] || `Image ${i + 1}`,
-					src: ref.replace(/^!\[[^\]]*\]\(/, '').replace(/\)$/, '').trim(),
-				}));
+				const items = images.map((ref, i) =>
+					parseImageRef(ref, `Image ${i + 1}`),
+				);
 
-				const markdowns = await downloadImages(items, status, warn, signal);
+				const markdowns = await downloadImages(
+					ctl, items, status, warn, signal, spoofHeaders,
+				);
 				if (markdowns.length === 0) {
 					warn('Error fetching images');
-					return items.map(({ alt }) => ({ image: "!" + toMarkdownLink(alt, ""), analysis: null }));
+					return items.map(({ alt }) => ({ image: "!" + toMarkdownLink(limitAltText(alt), ""), analysis: null }));
 				}
 
-				// A task implies the caller wants analysis; default its length to the recommended ~100/image budget (min 5).
-				const targetWords = wordsPerImage && wordsPerImage > 0
-					? wordsPerImage
-					: focus
-						? Math.round(Math.max(100 / imageURLs.length, 5))
-						: 0;
 				let analyses:(string | null)[] = markdowns.map(() => null);
-				if (targetWords > 0) {
-					const prompt = focus ?? "Describe this image. Start with its type (photo, illustration, screenshot, texture, icon, diagram, etc.), describe the style, setting, composition, function, viewing angle, and surroundings, then focus on the main subject in great detail followed by any other notable details. No introductory phrases. If in doubt about the type, name all that apply with the most likely option first.";
-					const result = await analyzeImages(markdowns, prompt, targetWords, status, warn);
-					if (Array.isArray(result))
-						analyses = result.map(r => r.analysis);
-					else
-						warn(result); // e.g. no vision model loaded — keep the images, skip analysis
+				if (focus || (wordsPerImage !== undefined && wordsPerImage > 0)) {
+					const targetWords = resolveTargetWords(images.length, wordsPerImage, focus);
+					const model = await resolveVisionModel(ctl);
+					if (!model)
+						warn("No vision-capable model loaded. Images downloaded without analysis.");
+					else {
+						const prompt = buildAnalysisPrompt(focus, targetWords);
+						const maxTokens = computeMaxTokens(targetWords);
+						const result = await analyzeImages(
+							ctl, model, markdowns, IMAGE_ANALYSIS_SYSTEM_DEFAULT, prompt, maxTokens, status, warn,
+						);
+						if (Array.isArray(result))
+							analyses = result.map(r => r.analysis);
+						else
+							warn(result);
+					}
 				}
 
 				status(`Viewed ${markdowns.length} image${markdowns.length > 1 ? "s" : ""}.`);
 				return markdowns.map((image, i) => ({ image, analysis: analyses[i] }));
-			} catch (error:unknown) {
+			}
+			catch (error:unknown) {
 				if (error instanceof DOMException && error.name === "AbortError")
 					return "Image viewing aborted by user.";
 				if (error instanceof Error) {
@@ -278,7 +171,7 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 
 	const visitWebsiteTool = tool({
 		name: "Visit Website",
-		description: "Visit a website and return its title, headings, links, images, and text content. Links and images are returned as ready-to-use markdown ([text](url) and ![alt](path)); images are automatically downloaded, so write each image markdown directly into your reply (not in a code block) to display them.",
+		description: "Visit a website to get its title, headings, links, images, and text content. links and images arrays contain ready-to-use markdown strings, `[text](url)` and `![alt](path)` respectively, to be written directly into your reply for display (not in a code block).",
 		parameters: {
 			url: z.string().url().describe("The URL of the website to visit"),
 			findInPage: z.array(z.string()).optional().describe("Highly recommended! Optional search terms to prioritize which links, images, and content to return."),
@@ -291,41 +184,38 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 			status("Visiting website...");
 
 			try {
-				maxLinks = undefinedIfAuto(ctl.getPluginConfig(configSchematics).get("maxLinks"), -1)
-					?? maxLinks
-					?? 40;
-				maxImages = undefinedIfAuto(ctl.getPluginConfig(configSchematics).get("maxImages"), -1)
-					?? maxImages
-					?? 10;
-				contentLimit = undefinedIfAuto(ctl.getPluginConfig(configSchematics).get("contentLimit"), -1)
-					?? contentLimit
-					?? 2000;
+				const config = ctl.getPluginConfig(configSchematics);
+				const getConfig = <T>(name:Parameters<typeof config.get>[0], autoValue:T) =>
+					config.get(name) === autoValue ? null : config.get(name) as T;
+				maxLinks = getConfig("maxLinks", -1) ?? maxLinks ?? 40;
+				maxImages = getConfig("maxImages", -1) ?? maxImages ?? 10;
+				contentLimit = getConfig("contentLimit", -1) ?? contentLimit ?? 2000;
 
 				const { head, body } = await fetchHTML(url, signal, warn);
 				status("Website visited successfully.");
-				
-				const title = head.match(/<title>([^<]*)<\/title>/)?.[1] || ""
+
+				const title = head.match(/<title>([^<]*)<\/title>/)?.[1] || "";
 				const h1 = body.match(/<h1[^>]*>([^<]*)<\/h1>/)?.[1] || "";
 				const h2 = body.match(/<h2[^>]*>([^<]*)<\/h2>/)?.[1] || "";
 				const h3 = body.match(/<h3[^>]*>([^<]*)<\/h3>/)?.[1] || "";
 				const links = maxLinks && extractLinks(body, url, maxLinks, searchTerms);
 				const imagesToFetch = maxImages ? extractImages(body, url, maxImages, searchTerms) : [];
 				const images = maxImages && imagesToFetch.length > 0
-					? await downloadImages(imagesToFetch, status, warn, signal) // Pass the full image objects so each image's alt text is preserved
+					? await downloadImages(ctl, imagesToFetch, status, warn, signal, spoofHeaders)
 					: [];
 
 				// fetch the text content from the body using DOMParser
 				const allContent = contentLimit && htmlToPlainText(body) || '';
-				
+
 				let content = "";
-				if(searchTerms?.length && contentLimit < allContent.length) {
+				if (searchTerms?.length && contentLimit < allContent.length) {
 					const padding = `.{0,${contentLimit / (searchTerms.length * 2)}}`;
 					const matches = searchTerms
 						.map(term => new RegExp(padding + term + padding, 'gi').exec(allContent))
 						.filter(match => !!match)
 						.sort((a, b) => a.index - b.index); // Sort by index in the content
 					let nextMinIndex = 0;
-					for(const match of matches) {
+					for (const match of matches) {
 						// Ensure we don't return duplicates by merging overlapping matches
 						content += match.index >= nextMinIndex
 							// The Match does not overlap with the previous one
@@ -335,15 +225,16 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 						nextMinIndex = match.index + match[0].length;
 					}
 				}
-				else content = allContent.slice(0, contentLimit) // Limit text length
-					
+				else content = allContent.slice(0, contentLimit); // Limit text length
+
 				return {
 					url, title, h1, h2, h3,
 					...(links ? { links } : {}),
 					...(images ? { images } : {}),
 					...(content ? { content } : {}),
 				};
-			} catch (error:unknown) {
+			}
+			catch (error:unknown) {
 				if (error instanceof DOMException && error.name === "AbortError")
 					return "Website visit aborted by user.";
 				if (error instanceof Error) {
@@ -362,23 +253,8 @@ export async function toolsProvider(ctl:ToolsProviderController):Promise<Tool[]>
 	return tools;
 }
 
-const undefinedIfAuto = (value:unknown, autoValue:unknown) =>
-	value === autoValue ? undefined : value as undefined;
-
 // Extensions that disqualify a URL from being treated as an image (extensionless URLs are allowed)
 const nonImageExtensions = ["js", "css", "html", "htm", "json", "xml", "pdf", "zip", "gz", "tar", "mp4", "mp3", "webm", "ogg", "woff", "woff2", "ttf", "eot"];
-
-const mimeToExtension: Record<string, string> = {
-	"image/jpeg": "jpg",
-	"image/jpg": "jpg",
-	"image/png": "png",
-	"image/gif": "gif",
-	"image/webp": "webp",
-	"image/svg+xml": "svg",
-	"image/avif": "avif",
-	"image/bmp": "bmp",
-	"image/tiff": "tiff",
-};
 
 const spoofedUserAgents = [
 	// Random realistic user agents to spoof when fetching pages
@@ -401,7 +277,7 @@ const spoofedUserAgents = [
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36",
 	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:97.0) Gecko/20100101 Firefox/97.0",
 	"Opera/9.80 (Android 7.0; Opera Mini/36.2.2254/119.132; U; id) Presto/2.12.423 Version/12.16",
-]
+];
 
 function spoofHeaders(url:string) {
 	const domain = new URL(url).hostname;
